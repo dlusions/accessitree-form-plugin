@@ -3,7 +3,7 @@
  * Plugin Name: YOOtheme Essentials — Form Entries (shared table + viewer/export)
  * Description: Receives YOOtheme Essentials Webhook posts, stores as JSON in one shared table, adds wp-admin lists (Forms summary + per-form entries + single-entry printable view) and CSV export. Accepts JSON or Form-Data payloads. Supports per-form manual column ordering and bulk delete.
  * Version: 1.5.4
- * Author: OSS Helper
+ * Author: AccessiTREE
  */
 
 if (!defined('ABSPATH')) exit;
