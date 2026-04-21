@@ -2,7 +2,7 @@
 /**
  * Plugin Name: YOOtheme Essentials — Form Entries (shared table + viewer/export)
  * Description: Receives YOOtheme Essentials Webhook posts, stores as JSON in one shared table, adds wp-admin lists (Forms summary + per-form entries + single-entry printable view) and CSV export. Accepts JSON or Form-Data payloads. Supports per-form manual column ordering and bulk delete.
- * Version: 1.5.4
+ * Version: 1.5.5
  * Author: AccessiTREE
  */
 
@@ -14,6 +14,8 @@ class YTP_Form_Entries {
     private $table;
     private $secret_option = 'ytp_form_webhook_secret';
     private $order_option  = 'ytp_columns_order_map'; // array: form_key => [field, field, ...]
+    private $http_auth_user_option = 'ytp_form_http_auth_user';
+    private $http_auth_pass_option = 'ytp_form_http_auth_pass';
 
     public function __construct() {
         global $wpdb;
@@ -35,6 +37,68 @@ class YTP_Form_Entries {
             '_wpnonce','_wpnonce_yooessentials','_wp_http_referer',
             'action','format','method','url','_locale','_method','_charset_'
         ];
+    }
+
+    /**
+     * Some Essentials/Webhook builds submit nested payloads or JSON strings instead of
+     * the original flat payload we expected. Normalize those shapes into one array.
+     */
+    private function normalize_request_body(\WP_REST_Request $req): array {
+        $body = $req->get_json_params();
+        if (!is_array($body) || !$body) {
+            $body = $req->get_body_params();
+        }
+        if (!is_array($body)) {
+            $body = [];
+        }
+
+        foreach (['payload', 'data', 'submission'] as $key) {
+            if (!isset($body[$key])) {
+                continue;
+            }
+
+            if (is_string($body[$key])) {
+                $decoded = json_decode(wp_unslash($body[$key]), true);
+                if (is_array($decoded)) {
+                    $body[$key] = $decoded;
+                }
+            }
+        }
+
+        return $body;
+    }
+
+    private function extract_payload(array $body): array {
+        foreach (['payload', 'data'] as $key) {
+            if (isset($body[$key]) && is_array($body[$key])) {
+                return $body[$key];
+            }
+        }
+
+        if (isset($body['submission']) && is_array($body['submission'])) {
+            foreach (['payload', 'data', 'fields'] as $nested_key) {
+                if (isset($body['submission'][$nested_key]) && is_array($body['submission'][$nested_key])) {
+                    return $body['submission'][$nested_key];
+                }
+            }
+
+            return $body['submission'];
+        }
+
+        return array_diff_key($body, array_flip($this->reserved_keys()));
+    }
+
+    private function first_non_empty_string(...$values): string {
+        foreach ($values as $value) {
+            if (is_scalar($value)) {
+                $value = trim((string) $value);
+                if ($value !== '') {
+                    return $value;
+                }
+            }
+        }
+
+        return '';
     }
 
     public function on_activate() {
@@ -79,23 +143,43 @@ class YTP_Form_Entries {
     public function ingest(\WP_REST_Request $req) {
         $secret = get_option($this->secret_option);
 
-        $body = $req->get_json_params();
-        if (!is_array($body) || !$body) $body = $req->get_body_params();
-        if (!is_array($body)) $body = [];
+        $body = $this->normalize_request_body($req);
 
         $provided = isset($body['secret']) ? (string)$body['secret'] : '';
         if (!$secret || !$provided || !hash_equals($secret, $provided)) {
             return new \WP_REST_Response(['error' => 'Unauthorized'], 401);
         }
 
-        if (isset($body['payload']) && is_array($body['payload'])) {
-            $payload = $body['payload'];
-        } else {
-            $payload = array_diff_key($body, array_flip($this->reserved_keys()));
+        $payload = $this->extract_payload($body);
+
+        $raw_form_key = $this->first_non_empty_string(
+            $body['form_key'] ?? null,
+            $body['submission']['form_key'] ?? null,
+            $payload['form_key'] ?? null,
+            $payload['name'] ?? null
+        );
+        $raw_form_id = $this->first_non_empty_string(
+            $body['form_id'] ?? null,
+            $body['formid'] ?? null,
+            $body['submission']['form_id'] ?? null,
+            $body['submission']['formid'] ?? null,
+            $payload['form_id'] ?? null,
+            $payload['formid'] ?? null,
+            $payload['id'] ?? null
+        );
+
+        $form_key = sanitize_key($raw_form_key);
+        $form_id  = sanitize_text_field($raw_form_id);
+
+        // Newer webhook payloads may omit one of the identifiers. Keep storage working
+        // by deriving the missing value from the other stable identifier.
+        if (!$form_key && $form_id) {
+            $form_key = sanitize_key($form_id);
+        }
+        if (!$form_id && $form_key) {
+            $form_id = $form_key;
         }
 
-        $form_key = isset($body['form_key']) ? sanitize_key($body['form_key']) : (isset($payload['form_key']) ? sanitize_key($payload['form_key']) : '');
-        $form_id  = isset($body['form_id'])  ? sanitize_text_field($body['form_id']) : (isset($payload['formid']) ? sanitize_text_field($payload['formid']) : '');
         if (!$form_key || !$form_id) {
             return new \WP_REST_Response(['error' => 'Missing form identifiers'], 400);
         }
@@ -104,7 +188,13 @@ class YTP_Form_Entries {
             'ip'         => $_SERVER['REMOTE_ADDR'] ?? null,
             'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? null,
         ];
-        $files = (isset($body['files']) && is_array($body['files'])) ? $body['files'] : [];
+        $files = [];
+        if (isset($body['files']) && is_array($body['files'])) {
+            $files = $body['files'];
+        } elseif (isset($payload['files']) && is_array($payload['files'])) {
+            $files = $payload['files'];
+            unset($payload['files']);
+        }
 
         global $wpdb;
         $wpdb->insert($this->table, [
@@ -167,6 +257,17 @@ CSS;
     }
 
     public function load_screen() {
+        if (isset($_POST['ytp_save_http_auth']) && current_user_can('manage_options')) {
+            check_admin_referer('ytp_save_http_auth');
+            update_option($this->http_auth_user_option, isset($_POST['ytp_http_auth_user']) ? sanitize_text_field(wp_unslash($_POST['ytp_http_auth_user'])) : '');
+            update_option($this->http_auth_pass_option, isset($_POST['ytp_http_auth_pass']) ? sanitize_text_field(wp_unslash($_POST['ytp_http_auth_pass'])) : '');
+            wp_safe_redirect(add_query_arg([
+                'page' => 'ytp-form-entries',
+                'http_auth_saved' => 1,
+            ], admin_url('admin.php')));
+            exit;
+        }
+
         // Save manual order
         if (isset($_POST['ytp_save_order']) && current_user_can('manage_options')) {
             check_admin_referer('ytp_save_order');
@@ -215,6 +316,41 @@ CSS;
 
     private function get_secret() { return get_option($this->secret_option); }
     private function get_order_map() { $m = get_option($this->order_option, []); return is_array($m) ? $m : []; }
+    private function get_http_auth_user() { return (string) get_option($this->http_auth_user_option, ''); }
+    private function get_http_auth_pass() { return (string) get_option($this->http_auth_pass_option, ''); }
+    private function get_webhook_url($with_auth = false) {
+        $url = rest_url('ytp/v1/forms/ingest');
+        if (!$with_auth) {
+            return $url;
+        }
+
+        $user = $this->get_http_auth_user();
+        $pass = $this->get_http_auth_pass();
+        if ($user === '' || $pass === '') {
+            return $url;
+        }
+
+        $parts = wp_parse_url($url);
+        if (!$parts || empty($parts['scheme']) || empty($parts['host'])) {
+            return $url;
+        }
+
+        $auth = rawurlencode($user) . ':' . rawurlencode($pass) . '@';
+        $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+        $path = $parts['path'] ?? '';
+        $query = isset($parts['query']) ? '?' . $parts['query'] : '';
+        $fragment = isset($parts['fragment']) ? '#' . $parts['fragment'] : '';
+
+        return sprintf(
+            '%s://%s%s%s%s%s',
+            $parts['scheme'],
+            $auth,
+            $parts['host'],
+            $port,
+            $path,
+            $query . $fragment
+        );
+    }
     private function get_form_order($form_key) {
         $map = $this->get_order_map();
         return isset($map[$form_key]) && is_array($map[$form_key]) ? $map[$form_key] : [];
@@ -404,7 +540,10 @@ CSS;
         if (!current_user_can('manage_options')) wp_die(__('Insufficient permissions.', 'ytp-form-entries'));
 
         $secret   = esc_html(get_option($this->secret_option));
-        $webhook  = esc_url_raw(rest_url('ytp/v1/forms/ingest'));
+        $webhook  = esc_url_raw($this->get_webhook_url(false));
+        $webhook_with_auth = $this->get_webhook_url(true);
+        $http_auth_user = $this->get_http_auth_user();
+        $http_auth_pass = $this->get_http_auth_pass();
         $selected = isset($_GET['form_key']) ? sanitize_text_field($_GET['form_key']) : '';
         $view     = isset($_GET['view']) ? sanitize_key($_GET['view']) : '';
         $is_detail = (!empty($selected) && $view !== 'entry');
@@ -412,7 +551,12 @@ CSS;
 
         echo '<div class="wrap"><h1>Form Entries</h1>';
         echo '<div class="notice notice-info ytp-no-print"><p><strong>Webhook Endpoint:</strong> ' . esc_html($webhook) . '</p>';
-        echo '<p><strong>Body/Form-Data secret:</strong> <code>' . $secret . '</code></p></div>';
+        echo '<p><strong>Body/Form-Data secret:</strong> <code>' . $secret . '</code></p>';
+        echo '<p><strong>HTTP Auth Helper:</strong> For password-protected dev/staging sites, save the site HTTP auth credentials below and use the generated authenticated webhook URL in YooEssentials.</p>';
+        if ($webhook_with_auth !== $webhook) {
+            echo '<p><strong>Authenticated Webhook URL:</strong> <code>' . esc_html($webhook_with_auth) . '</code></p>';
+        }
+        echo '</div>';
 
         if (!empty($_GET['deleted'])) {
             $cnt = (int) $_GET['deleted'];
@@ -420,8 +564,33 @@ CSS;
                  esc_html(sprintf(_n('Deleted %d entry.', 'Deleted %d entries.', $cnt, 'ytp-form-entries'), $cnt)) .
                  '</p></div>';
         }
+        if (!empty($_GET['http_auth_saved'])) {
+            echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('HTTP auth settings saved.', 'ytp-form-entries') . '</p></div>';
+        }
         if (!empty($_GET['saved'])) {
             echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Column order saved.', 'ytp-form-entries') . '</p></div>';
+        }
+
+        if (!$is_detail && !$is_entry) {
+            echo '<div class="postbox ytp-no-print" style="max-width:980px;padding:16px 20px;margin:16px 0;">';
+            echo '<h2 style="margin-top:0;">' . esc_html__('Dev / Staging HTTP Auth', 'ytp-form-entries') . '</h2>';
+            echo '<p>' . esc_html__('Optional. If the site is protected with HTTP Basic Auth, save the credentials here and copy the authenticated webhook URL into YooEssentials. Leave blank on production.', 'ytp-form-entries') . '</p>';
+            echo '<form method="post">';
+            wp_nonce_field('ytp_save_http_auth');
+            echo '<input type="hidden" name="ytp_save_http_auth" value="1" />';
+            echo '<table class="form-table" role="presentation"><tbody>';
+            echo '<tr><th scope="row"><label for="ytp_http_auth_user">' . esc_html__('Username', 'ytp-form-entries') . '</label></th>';
+            echo '<td><input type="text" class="regular-text" id="ytp_http_auth_user" name="ytp_http_auth_user" value="' . esc_attr($http_auth_user) . '" autocomplete="off" /></td></tr>';
+            echo '<tr><th scope="row"><label for="ytp_http_auth_pass">' . esc_html__('Password', 'ytp-form-entries') . '</label></th>';
+            echo '<td><input type="password" class="regular-text" id="ytp_http_auth_pass" name="ytp_http_auth_pass" value="' . esc_attr($http_auth_pass) . '" autocomplete="new-password" />';
+            if ($webhook_with_auth !== $webhook) {
+                echo '<p class="description" style="margin-top:8px;">' . esc_html__('Generated authenticated URL:', 'ytp-form-entries') . ' <code>' . esc_html($webhook_with_auth) . '</code></p>';
+            }
+            echo '</td></tr>';
+            echo '</tbody></table>';
+            submit_button(__('Save HTTP Auth Settings', 'ytp-form-entries'));
+            echo '</form>';
+            echo '</div>';
         }
 
         if ($is_entry) {
